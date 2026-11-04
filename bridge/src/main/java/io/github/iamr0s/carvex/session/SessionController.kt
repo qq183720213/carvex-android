@@ -150,7 +150,12 @@ class SessionController(
                 encodedFps=(encoded.get()-measuredEncoded)/seconds,droppedFrames=dropped.get(),queueMs=queueMs.getAndSet(0),writeMs=writeMs.getAndSet(0),idrRequests=idr.get())}
             measuredAt=now;measuredFrames=f;measuredBytes=b;measuredEncoded=encoded.get()
         },1000,1000,TimeUnit.MILLISECONDS)
-        fun failure(t:Throwable){if(attemptJob.isActive&&!ended.get()&&failed.complete(t)){BridgeStore.log(id,"channel failure "+t.javaClass.simpleName+" "+(t.message?:"no message"));if(false)t.stackTrace.take(4).forEach{BridgeStore.log(id,"${"channel origin "}${it}")};cleanup.close()}}
+        // Cleanup must not run on the thread that observed the failure: failure() is reachable from
+        // RTSP reader/event threads and from iAP readers, while AirSession.close() now has to send a
+        // bounded whole-session TEARDOWN that waits for the control reader. Running that on the
+        // reader thread itself stalls until the budget expires (observed as "InterruptedException"
+        // on the TEARDOWN). Hand cleanup to its own thread so the caller can unwind its read loop.
+        fun failure(t:Throwable){if(attemptJob.isActive&&!ended.get()&&failed.complete(t)){BridgeStore.log(id,"channel failure "+t.javaClass.simpleName+" "+(t.message?:"no message"));if(false)t.stackTrace.take(4).forEach{BridgeStore.log(id,"${"channel origin "}${it}")};Thread({runCatching{cleanup.close()}},"session-cleanup").apply{isDaemon=true;start()}}}
         suspend fun <T> phase(stage:Stage,millis:Long,block:suspend()->T):T {
             BridgeStore.update(id){it.copy(stage=stage,detail=stage.title,error=null)}
             BridgeStore.log(id,"stage "+stage.name)

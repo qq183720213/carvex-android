@@ -41,7 +41,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     /** Selected internally for this peer; not inferred from physical transport. */
     private val setupInputProvider:SetupInputProvider?=null,
     private val pairedCapabilityGate:Boolean?=null,
-    controlPublication:CarPlayControlPublication?=null) {
+    controlPublication:CarPlayControlPublication?=null) : AutoCloseable {
     private val network=path.network
     @Volatile private var address=Bootstrap.address(path.properties,bootstrap.address)
     /** Current endpoint candidates also constrain timing/invitation peers. The
@@ -64,7 +64,9 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             Bootstrap.address(path.properties,requireNotNull(it.address.hostAddress))},peer)},
         readTimeoutMs=readTimeoutMs)
     @Volatile private var client:RtspClient?=null
-    @Volatile private var stopping=false
+    /** Set once by whichever path stops the session first; the whole-session TEARDOWN is
+     *  therefore attempted exactly once no matter how many exits observe it. */
+    private val stopping=java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var localMediaAddress:InetAddress?=null
     @Volatile private var screen:Screen?=null
     /** Owns teardown even if preparation fails before a video encoder exists. */
@@ -76,7 +78,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     @Volatile var requestKeyFrame:(()->Boolean)?=null
     @Volatile var screenOwnership:((Boolean)->Boolean)?=null
     private val commandLock=Any()
-    private val events=SessionEventGate(securityBinding){!stopping&&sourceContextCurrent()}
+    private val events=SessionEventGate(securityBinding){!stopping.get()&&sourceContextCurrent()}
     private val hidKeys=HidKeyRegistry()
     private val controlSiri=SiriRequests{voice(it.toString())}
     private val eventSiri=SiriRequests(allowMissingCSeq=true){voice(it.toString())}
@@ -136,7 +138,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     @Volatile private var runtimeCapabilities=CapabilityRegistry()
     private val nowPlayingPublisher=NowPlayingPublisher{runtime.send(NowPlayingUpdate.ID,it)}
     private fun emitRuntime(bytes:ByteArray):Boolean{
-        if(stopping||!options.experiment)return false
+        if(stopping.get()||!options.experiment)return false
         tunnel?.let{return it.send(bytes)}
         return runtimeOutput.trySend(bytes).isSuccess
     }
@@ -158,7 +160,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     },identificationAccepted={runtimeCapabilities=it.capabilities})
     private val channelFailed=java.util.concurrent.atomic.AtomicBoolean(false)
     private fun channelFailure(source:String,t:Throwable){
-        if(stopping)return // Normal stop owns cleanup; rejected late business is not a new failure.
+        if(stopping.get())return // Normal stop owns cleanup; rejected late business is not a new failure.
         // Reader, deadline and waiting writers may observe the same terminal cause.
         if(!channelFailed.compareAndSet(false,true))return
         log("${"channel source="}${source}${" "}"+t.javaClass.simpleName+" "+(t.message?:"no message"))
@@ -202,30 +204,56 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
 
     /** App disconnect, not process force-stop. Retain control until the whole
      * session transaction is confirmed or its bounded local failure is known. */
-    fun stopNormally(){
-        stopping=true
+    fun stopNormally()=stopWholeSession("user")
+
+    /** Release the peer's session before dropping local transports.
+     *
+     * A receiver that accepted our SETUP keeps its own session in an "connecting" state until it
+     * either receives a whole-session TEARDOWN or sees the control transport die. We used to rely
+     * on the latter only for failure paths: `Resources.close()` closes sockets silently, so a
+     * session that failed on our side (encoder error, deadline, iAP link loss) left the head unit
+     * waiting forever - the phone said connected, the car stayed on its connecting screen and its
+     * own exit button did nothing. Every exit path now attempts the same bounded TEARDOWN.
+     *
+     * Idempotent: repeated or concurrent callers observe one result and never send twice. */
+    private fun stopWholeSession(reason:String){
+        if(!stopping.compareAndSet(false,true)) {
+            log("AirPlay whole-session stop already owned; extra "+reason+" request ignored")
+            return
+        }
         val control=client;val url=connectionPath;val setup=setupLifecycle
         // The volatile gate rejects new business without waiting for a running
         // host event callback. Keep resource close/join after control completion.
-        audioStreams.close();setup?.beginWholeSessionStop()
-        runtimeOutput.close();modeOutput.close();scope.cancel()
+        runCatching{audioStreams.close()};runCatching{setup?.beginWholeSessionStop()}
+        runCatching{runtimeOutput.close()};runCatching{modeOutput.close()}
+        // Do not cancel the session scope yet: the control reader must keep running
+        // while the TEARDOWN below waits for its 2xx, and a cancelled scope used to
+        // make the waiting writer throw InterruptedException instead of sending.
         try{
             if(control==null||url==null||setup==null||!control.readerRunning){
                 log("AirPlay whole-session stop skipped: established session control unavailable")
                 return
             }
-            log("AirPlay whole-session TEARDOWN begin streams=absent teardownType=absent totalBudgetMs=5000")
+            log("AirPlay whole-session TEARDOWN begin streams=absent teardownType=absent totalBudgetMs=5000 reason="+reason)
             control.stopSession(url)
             log("AirPlay whole-session TEARDOWN accepted; closing local transports")
         }catch(t:Exception){
             // This is our forced local cleanup policy, not EnsureStopped's native error exit.
             log("AirPlay whole-session TEARDOWN unconfirmed: "+t.javaClass.simpleName+"; forcing local cleanup")
         }finally{
+            log("AirPlay whole-session stop complete reason="+reason)
+            scope.cancel()
             control?.close()
             // Resources closes tunnel/data sockets before runtime.close(). A
             // runtime writer may still hold its link lock in a socket write.
         }
     }
+
+    /** Failure/missed-stop exit. `Resources` owns this instance, so a session that died for any
+     *  local reason still tells the receiver to drop the session instead of leaving the head unit
+     *  on its connecting screen. One TEARDOWN attempt covers every exit path. */
+    override fun close()=stopWholeSession("close")
+
     /**
      * type=130 专用承载（第 13 章 §2.6b）。
      *
@@ -1019,7 +1047,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         }finally{audioSetupLock.unlock()}
     }
     private suspend fun createAudioLocked(category:Int,source:PcmFormat,onMicrophone:(suspend (ByteArray,PcmFormat)->Boolean)?):NegotiatedAudioTransport {
-        check(!stopping){"Audio session stopping"}
+        check(!stopping.get()){"Audio session stopping"}
         val wantsInput=category==3&&onMicrophone!=null
         val selected=CarPlayAudioPlan.selectPlayback(receiverAudio,category,source,
             requireDuplex=wantsInput,supportsCapture={format->
@@ -1066,12 +1094,12 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 if(category==1||category==3){
                     audioOwnershipLock.lock()
                     try{
-                        if(owned.compareAndSet(true,false)&&mainAudioUsers.decrementAndGet()==0&&!stopping)audioOwnership.releaseOwn()
+                        if(owned.compareAndSet(true,false)&&mainAudioUsers.decrementAndGet()==0&&!stopping.get())audioOwnership.releaseOwn()
                     }finally{audioOwnershipLock.unlock()}
                 }
             }catch(t:Throwable){closeError=t}
             try{
-                if(needsTeardown&&!stopping)control.plist("TEARDOWN",connectionPath?:"/",mapOf("streams" to listOf(AudioTeardownDescriptor.forType(route.type))))
+                if(needsTeardown&&!stopping.get())control.plist("TEARDOWN",connectionPath?:"/",mapOf("streams" to listOf(AudioTeardownDescriptor.forType(route.type))))
             }catch(t:Throwable){if(closeError==null)closeError=t else closeError.addSuppressed(t)}
             finally{
                 transportRef.get()?.let{audioTransports.remove(category,it)}
@@ -1124,7 +1152,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             // 音频流与屏幕流同一条连接 URL（固件：'stup' 不设自己的 URL，回落到连接 URL）。
             setupAttempted=true
             val response=control.plist("SETUP",connectionPath?:"/",mapOf("streams" to listOf(description)))
-            check(!stopping){"Audio session stopping"}
+            check(!stopping.get()){"Audio session stopping"}
             val stream=(response["streams"] as? List<*>)?.filterIsInstance<Map<*,*>>()?.singleOrNull{(it["type"] as? Number)?.toInt()==route.type}
                 ?:error("${"No unique audio SETUP response for category="}${category}")
             log("Audio SETUP accepted category="+category+" type="+route.type+" dataPort="+stream["dataPort"]+
@@ -1173,10 +1201,10 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
             }
             val transport=if(candidate.codec==CarPlayAudioPlan.Codec.PCM16)
                 CarPlayMediaAudio(udp,address,port,format,category,route.type,key,retransmit,takeOwnership,releaseStream,log,redEnabled,
-                    canSend={!stopping&&(category==2||audioOwnership.allowsMainSend())},
+                    canSend={!stopping.get()&&(category==2||audioOwnership.allowsMainSend())},
                     receiverHighAccuracyTimestamps=receiverHighAccuracyTimestamps)
             else CarPlayCompressedAudio.create(udp,address,port,category,route.type,candidate,key,retransmit,takeOwnership,releaseStream,log,
-                canSend={!stopping&&(category==2||audioOwnership.allowsMainSend())},redEnabled=redEnabled,
+                canSend={!stopping.get()&&(category==2||audioOwnership.allowsMainSend())},redEnabled=redEnabled,
                 receiverHighAccuracyTimestamps=receiverHighAccuracyTimestamps)
             transportRef.set(transport)
             val combined=microphone?.let{DuplexAudioTransport(transport,it)}?:transport
@@ -1209,7 +1237,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         try{createMicrophoneLocked(onPcm)}finally{audioSetupLock.unlock()}
     }
     private suspend fun createMicrophoneLocked(onPcm:suspend (ByteArray,PcmFormat)->Boolean):Pair<CarPlayMicReceiver,PcmFormat>? {
-        check(!stopping){"Audio session stopping"}
+        check(!stopping.get()){"Audio session stopping"}
         if(audioStreams.isActive(100,"speechRecognition")){log("Separate microphone SETUP skipped: type100/speechRecognition is reserved; duplex readiness must be checked on its transport");return null}
         // 麦克风与主音频共用 CarPlayAudioPlan 的一套优先序：此前这里自带的 `ELD -> 其它` 排序会让
         // "回退到 AAC-LC / OPUS" 在麦克风路径上静默失效（车机只广告 LC/OPUS 时被误判成无可用编码）。
@@ -1228,7 +1256,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         val lease=try{audioStreams.reserve(100,"speechRecognition",id)}catch(t:Throwable){udp.close();throw t}
         var setupAttempted=false
         fun finishClose(needsTeardown:Boolean){
-            val failure=runCatching{if(needsTeardown&&!stopping)control.plist("TEARDOWN",connectionPath?:"/",mapOf("streams" to listOf(micTeardownDescriptor())))}.exceptionOrNull()
+            val failure=runCatching{if(needsTeardown&&!stopping.get())control.plist("TEARDOWN",connectionPath?:"/",mapOf("streams" to listOf(micTeardownDescriptor())))}.exceptionOrNull()
             audioStreams.completeClose(lease,failure)
             failure?.let{log("Microphone release not confirmed: "+it.javaClass.simpleName+"; same-type replacement suppressed")}
         }
@@ -1241,7 +1269,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 "supportsHighAccuracyTimestamps" to true,"supportsRTPPacketRedundancy" to true)
             setupAttempted=true
             val response=control.plist("SETUP",connectionPath?:"/",mapOf("streams" to listOf(desc)))
-            check(!stopping){"Audio session stopping"}
+            check(!stopping.get()){"Audio session stopping"}
             val stream=(response["streams"] as? List<*>)?.filterIsInstance<Map<*,*>>()?.singleOrNull{(it["type"] as? Number)?.toInt()==100}?:error("No microphone stream response")
             // 响应 dataPort 对 sink-only 可省略，且不是麦克风监听/源端口（ch09 §2.3）：
             // 只校验范围，不拿它过滤来源；来源过滤交给 peerPort=0。
@@ -1278,7 +1306,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
     }
     /** 屏幕流保活帧（第 07 章 §2.6.1）：128 字节明文头、`0x04=2`、无正文，不消耗帧 nonce。 */
     private fun keepAliveFrame():Unit=videoDiagnostics.trace("keepalive"){ticket->synchronized(this){
-        if(stopping)return@synchronized
+        if(stopping.get())return@synchronized
         videoDiagnostics.phase(ticket,VideoSendDiagnostics.Phase.ENCRYPT)
         val socket=video?:return@synchronized
         val packet=VideoWire.keepAlive()
@@ -1288,7 +1316,7 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
         socket.getOutputStream().flush()
     }}
     fun send(packet:ByteArray,config:Boolean,ptsMonoUs:Long?):Unit=videoDiagnostics.trace(if(config)"config" else "frame"){ticket->synchronized(this){
-        if(stopping)return@synchronized
+        if(stopping.get())return@synchronized
         videoDiagnostics.phase(ticket,VideoSendDiagnostics.Phase.ENCRYPT)
         check(screen!=null);val socket=video?:error("No video socket")
 

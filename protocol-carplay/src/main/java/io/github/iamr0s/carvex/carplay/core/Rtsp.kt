@@ -165,6 +165,13 @@ class RtspClient(input:InputStream,var output:OutputStream,
      * Repeated/concurrent callers observe the same result, never another request. */
     fun stopSession(path:String,budgetMs:Int=5_000){
         require(budgetMs>0)
+        // The drain below waits for activeOperations to reach zero, and this thread may itself be
+        // one of them (a failure observed on the control reader/event path). Waiting there would
+        // stall until the budget expired and surface as InterruptedException, so refuse early: the
+        // owner must call this from its own thread, and the caller's cleanup still closes the socket.
+        require(Thread.currentThread()!==reader&&Thread.currentThread()!==eventThread){
+            "Whole-session stop must not run on the control reader/event thread"
+        }
         var owner=false
         val result=synchronized(lifecycleLock){
             stopResult?:run{

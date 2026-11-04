@@ -201,4 +201,45 @@ class RtspNormalStopTest {
         try{assertThrows(IllegalStateException::class.java){client.stopSession(path)};assertEquals(0,output.size())}
         finally{client.close()}
     }
+
+    @Test fun wholeSessionStopRefusesToRunOnTheControlReaderOrEventThread(){
+        // Cleanup is reachable from the reader/event threads. Draining activeOperations there would
+        // wait on the very operation that is calling in, so it is refused up front instead of
+        // stalling until the budget expires.
+        Peer().use{p->
+            var readerFailure:Throwable?=null;var eventFailure:Throwable?=null
+            val readerThread=Thread({readerFailure=runCatching{p.client.stopSession(path)}.exceptionOrNull()},
+                "rtsp-reader")
+            val eventThread=Thread({eventFailure=runCatching{p.client.stopSession(path)}.exceptionOrNull()},
+                "rtsp-events")
+            // The guard compares against the client's own threads, so emulate by direct field access
+            // through reflection of the same names the client uses.
+            val readerField=RtspClient::class.java.getDeclaredField("reader").apply{isAccessible=true}
+            val eventField=RtspClient::class.java.getDeclaredField("eventThread").apply{isAccessible=true}
+            val originalReader=readerField.get(p.client) as Thread?
+            val originalEvent=eventField.get(p.client) as Thread?
+            try{
+                readerField.set(p.client,readerThread);readerThread.start();readerThread.join(2_000)
+                assertTrue("stop on reader thread must be refused",readerFailure is IllegalArgumentException)
+                eventField.set(p.client,eventThread);eventThread.start();eventThread.join(2_000)
+                assertTrue("stop on event thread must be refused",eventFailure is IllegalArgumentException)
+                // Nothing may have reached the wire while those callers were rejected.
+                assertNull(p.requests.poll(200,TimeUnit.MILLISECONDS))
+                assertFalse(p.client.sessionStopping)
+            }finally{readerField.set(p.client,originalReader);eventField.set(p.client,originalEvent)}
+        }
+    }
+
+    @Test fun repeatedWholeSessionStopSendsOneTeardown(){
+        Peer().use{p->
+            val first=task{p.client.stopSession(path)}
+            val request=p.next()
+            assertEquals("TEARDOWN $path RTSP/1.0",request.first)
+            val second=task{p.client.stopSession(path)}
+            p.reply(request)
+            first.get(2,TimeUnit.SECONDS);second.get(2,TimeUnit.SECONDS)
+            assertTrue("the repeated stop must not send a second request",
+                p.requests.poll(300,TimeUnit.MILLISECONDS)==null)
+        }
+    }
 }

@@ -98,7 +98,11 @@ class CarPlayRunner(
     }
 
     /** 构造 AirSession；媒体管线仍由编排层通过返回对象驱动（A 方案）。
-     *  `localFps` 与 `sourceContextCurrent` 依赖编排层状态，因此作为参数传入而不是放进 host。 */
+     *  `localFps` 与 `sourceContextCurrent` 依赖编排层状态，因此作为参数传入而不是放进 host。
+     *
+     *  The session is registered with `resources` so that every exit path closes it. Its own
+     *  close() sends the whole-session TEARDOWN; without it a receiver keeps waiting on a session
+     *  we already abandoned and never returns to its idle screen. */
     fun openSession(
         path: NetworkPath,
         bootstrap: WifiBootstrap,
@@ -106,7 +110,7 @@ class CarPlayRunner(
         localFps: (Int, Int, Int) -> Int?,
         sourceContextCurrent: () -> Boolean,
         controlPublication: CarPlayControlPublication? = null,
-    ): AirSession = AirSession(
+    ): AirSession = resources.own(AirSession(
         context, path, bootstrap, options, resources,
         host::log,
         host::touch,
@@ -122,5 +126,5 @@ class CarPlayRunner(
         security,
         sourceContextCurrent,
         controlPublication = controlPublication,
-    )
+    ))
 }
